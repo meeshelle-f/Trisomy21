@@ -1,0 +1,392 @@
+---
+title: "scSEQ AdultHumanSpermatogonia practice"
+author: "Michelle"
+date: "7/27/2021"
+output: html_document
+---
+
+```{Required packages}
+library(dplyr)
+install.packages("Seurat")
+library(Seurat)
+library(patchwork)
+install.packages("PercentageFeatureSet")
+library(PercentageFeatureSet)
+```
+
+```{Upload barcodes, genes and matrix data}
+
+#ensure names match CellRanger "barcodes.tsv, genes.tsv, and matrix.mtx"
+# Load the PBMC dataset, extract from .gz
+
+
+AdultHumanSpermatogonia.data <- Read10X(data.dir = "~/GitHub/scSeq/GSE109037")
+
+HSpbmc <- CreateSeuratObject(counts = AdultHumanSpermatogonia.data,project = "AdultHumanSpermatogonia")
+
+#str(HSpbmc) #dgCMatrix is a class from the Matrix R package that implements: general, numeric etc. in sparse format
+
+HSpbmc@assays$RNA@counts #33694 x 11104 sparse Matrix of class "dgCMatrix"
+```
+
+```{Calculate gene/row means with SeuratObject}
+
+#1st way
+HSpbmc <- FindVariableFeatures(HSpbmc, selection.method = "vst")
+mean_genes <- VariableFeaturePlot(HSpbmc) #calculates mean and standardized variance with colors! 
+mean_genes=data.frame(mean_genes$data)
+
+row.names(mean_genes)=rownames(mean_genes)
+mean_genes=mean_genes[,-3]
+
+#2nd way 
+pbmc <- FindVariableFeatures(object = HSpbmc, mean.function =ExpMean)
+head(x=HVFInfo(object=pbmc)) # mean and variance (not standardized!) 
+HVFInfo(pbmc)
+
+```
+
+```{Manually check mean from SeuratObject}
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(HSpbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(HSpbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+#check math of vst manually : 
+AdultHumanSpermatogonia.data[c("RP11-34P13.3"),1:10]
+RP11_34P13.3= as.matrix(AdultHumanSpermatogonia.data[c("RP11-34P13.3"),])
+colSums(RP11_34P13.3)/length(RP11_34P13.3) #0.0004502882
+#colSums #9643
+#length #11104
+#var(PTGDS) #235.7358
+#sqrt(235.7358) #15.35369
+PTGDS.data=plot1$data[c("PTGDS"),] #mean matches 
+
+plot1data=as.matrix(plot1$data[,-3]) # pull matrix of means and gene names for later use if needed 
+
+```
+
+```{Input gene symbol output chromosome location with Gviz}
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("ensembldb")
+
+rn=row.names(plot1data)
+
+library(ensembldb)
+library(EnsDb.Hsapiens.v79)
+
+edb <- EnsDb.Hsapiens.v79
+
+## Retrieve the genes
+gns <- genes(edb, filter = ~ seq_name == "21") #obtain all gene names on chr 21
+
+gns #GRanges object with 893 ranges and 6 metadata columns.
+
+#CREATE A LOOP 
+
+txs <- getGeneRegionTrackForGviz(
+    edb, filter = ~ genename %in% c("ADAMTS1"))
+
+tXS=data.frame(txs)
+
+y1=tXS$symbol[1]
+y2=as.character(tXS$seqnames[1])
+y3=min(tXS$start)
+y4=max(tXS$end)
+geneY=cbind(y1,y2,y3,y4)
+colnames(geneY)=c("gene symbol", "chr","start range", "end range")
+
+```
+
+```{Loop Gviz to gather all chromosome locations}
+
+library(ensembldb)
+library(EnsDb.Hsapiens.v79)
+edb <- EnsDb.Hsapiens.v79
+
+group_names= c("ADAMTS1","CYYR1") #set list of group names as gene symbols
+
+geneY=data.frame(matrix(length(group_names), ncol=4))
+geneY=data.frame(matrix(ncol=4, nrow=0))
+x=c("gene symbol", "chr","start range", "end range")
+
+  for(i in 1:length(group_names)) {
+    tXS= data.frame(getGeneRegionTrackForGviz(
+    edb, filter = ~ genename %in% group_names[i]))
+
+df = data.frame(tXS$symbol[1], as.character(tXS$seqnames[1]),min(tXS$start), max(tXS$end))
+names(df)=c("gene symbol", "chr","start range", "end range")
+
+geneY=rbind(geneY,df)
+}
+
+```
+
+```{Merge and or reorder chr location w ENSEMBL IDs and gene means}
+
+geneY_subset_NA=geneY[is.na(geneY$`gene symbol`),] # how many genes didn't get processed? Ex: ' FAAP20 '  
+dim(geneY_subset_NA) #596   4 
+596/33694 # 0.01768861, or 1.7% could be lost... :( 
+
+reorder=match(geneY$`gene symbol`,row.names(GENES)) #reorder GENES to match geneY 
+
+#GENES contains all symbols and ENSEMBL IDs prior to running through chr location loop ^, doesn't contain any NAs
+
+reorder
+
+GENES_reorder=GENES[reorder,] #reorder GENES to match geneY
+
+#looks great! let's double check manually though. 
+row.names(GENES_reorder)==geneY$`gene symbol` #Mostly true, some NA since haven't subsetted them yet. Will subset after ordering and binding. 
+
+GENES_mean_dets=cbind(GENES_reorder,geneY)
+
+GENES_mean_dets_removedNA=GENES_mean_dets[!is.na(GENES_mean_dets$`gene symbol`),] #drops rows containing NA
+
+dim(GENES_mean_dets) #  33098     6
+33694-33098 # 596, perfect!
+
+```
+
+```{Practice matrices to calculate FC}
+
+a= matrix(c(1,2,NA,4,5,6),nrow=3) # let matrix a represent GENES_means_dets, containing vector of gene means with length 33694 and 1.9% NA gene / associated mean values. 
+a=data.frame(a)
+
+ [,1] [,2]
+[1,]    1    4
+[2,]    2    5
+[3,]   NA    6
+
+sum(a[,2]>4)
+
+
+b=matrix(1:9,byrow=TRUE,nrow=3) #let matrix b represent gene values as rows and columns as cells 
+b=data.frame(b)
+    [,1] [,2] [,3]
+[1,]    1    2    3
+[2,]    4    5    6
+[3,]    7    8    9
+
+t(a[,1])
+
+[,1] [,2] [,3]
+[1,]    1    2   NA
+
+FC=mapply('/',b[,1],t(a[,1])) # able to divide matching vectors from a and b per gene per cell!  1  2 NA
+DF_FC=data.frame(FC)
+DF_FC= data.frame(FC[!is.na(FC)])
+mean_DF_FC=colSums(DF_FC)/nrow(DF_FC) #1.5 !!!!  
+
+# repeat for vector 2 
+
+FC_2=mapply('/',b[,2],t(a[,2]))
+DF_FC_2=data.frame(FC_2) # STOP HERE! Take this output of singular column representing FC for each and all genes in cell
+#cbind this to GENES_means_dets
+
+DF_FC_2= data.frame(FC_2[!is.na(FC_2)])
+mean_DF_FC_2=colSums(DF_FC_2)/nrow(DF_FC_2) #  0.9444444 !!!!  
+
+
+
+
+########################################
+
+a= matrix(c(1,2,NA,4,5,6),nrow=3) # let matrix a represent GENES_means_dets, containing vector of gene means with length 33694 and 1.9% NA gene / associated mean values. 
+a=data.frame(a)
+
+b=matrix(1:9,byrow=TRUE,nrow=3) #let matrix b represent gene values as rows and columns as cells 
+b=data.frame(b)
+
+FC_2=mapply('/',b[,2],t(a[,2]))
+DF_FC_2=data.frame(FC_2) # STOP HERE! Take this output of singular column representing FC for each and all genes in cell
+#cbind this to GENES_means_dets
+
+```
+
+```{Loop to calcualte gene FC per cell}
+HSpbmc@assays$RNA@counts #genes are rows, cells are columns. count matrix. 
+
+rownames(data.frame(HSpbmc@assays$RNA@counts[1:1000,]))==GENES_mean_dets$`gene symbol`[1:1000] #yay!!! 
+
+ncol(data.frame(HSpbmc@assays$RNA@counts)) #11104 cells 
+
+################################################
+geneY_=data.frame(matrix(ncol=0, nrow=33694))
+DF_HSpbmc=data.frame(HSpbmc@assays$RNA@counts)
+
+  for(i in 1:ncol(DF_HSpbmc)){
+    
+        #  GENES_mean_dets$Mean is a, and DF_HSpbmc@assays$RNA@counts[,j] is b
+      
+    tXS_= data.frame(DF_HSpbmc[,i]/(mean_genes$mean))
+
+     #  output should be singular column representing FC for each and all genes in cell
+     #  cbind this to GENES_means_dets within "FC"
+    
+row.names(geneY_)=rownames(mean_genes)
+
+geneY_=cbind(geneY_,tXS_)
+    }
+
+
+```
+
+```{Write GENES and DF_HSpbmc tables}
+write.table(GENES_mean_dets, "GENES_mean_dets_8.5.21",sep="\t")
+write.table(DF_HSpbmc, "DF_HSpbmc_8.5.21",sep="\t")
+
+```
+
+Per cell, count number of genes with value >1. Number produced represents # genes 
+This did not help provide a cutoff to filter the data. 
+
+```{r, loop for histogram genes >1 per cell}
+#store this value per cell. Should create a matrix with 1 row and 11104 variables
+DF_HSpbmc_8.5 <- read.delim("~/GitHub/scSeq/DF_HSpbmc_8.5.21", stringsAsFactors=FALSE)
+
+gene_Y_=data.frame(matrix(ncol=0, nrow=1)) 
+
+  for(i in 1:ncol(DF_HSpbmc)){
+    
+    t_XS_= data.frame(sum(DF_HSpbmc[,i]>1))
+
+     #  output should be singular column representing FC for each and all genes in cell
+     #  cbind this to GENES_means_dets within "FC"
+
+gene_Y_=cbind(gene_Y_,t_XS_)
+  }
+
+Genes_per_cell=t(gene_Y_)
+
+
+H_Genes_per_cell=hist(Genes_per_cell, breaks=20)
+
+H_Genes_per_cell
+
+write.table(Genes_per_cell, "Genes_per_cell_8.9.21",sep="\t")
+
+hist(Genes_per_cell, breaks=10, main="# Genes > 1 per cell, breaks=10")
+
+hist(Genes_per_cell, breaks=20, main="# Genes > 1 per cell, breaks=20")
+
+  
+```
+  
+Count the number of cells - per gene - that have a gene expression value '0'  
+```{Histogram and loop for total 0 counts per gene } 
+  
+#for each cell (column), count the number of genes that are >1. 
+#store this value per cell. Should create a matrix with 1 row and 11104 variables
+
+DF_HSpbmc_8.5 <- read.delim("~/GitHub/scSeq/DF_HSpbmc_8.5.21", stringsAsFactors=TRUE) 
+#import the big guy
+
+  
+gene_X=data.frame(matrix(ncol=1, nrow=0))
+
+  for(i in 1:nrow(DF_HSpbmc)){
+    
+    TXS= data.frame(sum(DF_HSpbmc[i,]==0))
+
+gene_X=rbind(gene_X,TXS)
+  }
+
+write.table(gene_X, "Sum0s_per_gene",sep="\t")
+
+hist(gene_X$sum.DF_HSpbmc.i.......0., main="# of 0 counts per gene")
+
+
+
+```
+
+```{Merge data needed to determine cutoff}
+plot1data <- read.csv("~/GitHub/scSeq/plot1data", row.names=1) #import means 
+Sum0s_per_gene # contains number of 0 counts per gene 
+
+info_for_cutoff=cbind(plot1data, gene_X)
+row.names(info_for_cutoff)=row.names(x)
+info_for_cutoff=info_for_cutoff[,-2]
+colnames(info_for_cutoff)=c("Mean","Number cells with 0 counts")
+
+info_for_cutoff= data.frame(info_for_cutoff,GENES_mean_dets_8_5$`start range`)
+info_for_cutoff= info_for_cutoff[,-4]
+colnames(info_for_cutoff)=c("Mean","Number cells with 0 counts","chromosome #")
+
+                       
+library(readr)
+
+GENES_mean_dets_8_5 <- read_delim("GENES_mean_dets_8.5.21", 
+    delim = "\t", trim_ws = TRUE)
+
+GENES_mean_dets_8_5
+
+info_for_cutoff= data.frame(info_for_cutoff,x$variance)
+info_for_cutoff=data.frame(info_for_cutoff$Mean,info_for_cutoff$x.variance,info_for_cutoff$chromosome..,info_for_cutoff$Number.cells.with.0.counts)
+colnames(info_for_cutoff)=c("Mean","Variance","chromosome #", "Number cells with 0 counts")
+
+
+write.table(info_for_cutoff, "info_for_cutoff_8.10.21",sep="\t")
+info_for_cutoff=cbind(info_for_cutoff_8.10,df_) #df_ is the previously calculated fold change 
+
+xlsx::write.xlsx(info_for_cutoff, file= "~info_for_cutoff.xlsx", row.names=T, col.names=T)
+
+
+
+
+
+sum(info_for_cutoff$`Number cells with 0 counts`=="11104")
+
+(3289/33694)*100
+
+H=hist(as.numeric(info_for_cutoff$`chromosome #`))
+print(H)
+H_dense=data.frame(H$density*100)
+
+
+cutoff=info_for_cutoff[!(info_for_cutoff$`Number cells with 0 counts`=="11104"),]
+dim(cutoff) #30405     4
+33694-3289 #30405
+
+as.factor(info_for_cutoff$`chromosome #`)
+info_for_cutoff$`chromosome #`
+
+dim(info_for_cutoff[info_for_cutoff$`chromosome #`=="Y",]) 
+
+
+H_cutoff=c(3665, 2853, 2299,1983,2239,2169,2101,1895,1802,1816,2500,2360,1260, 1973,1723,2115,2468, 1247,2555 ,1478,1091 ,1635,705)      
+H_cutoff_dense=data.frame((H_cutoff/33694)*100)
+row.names(H_cutoff_dense)=c("1","2","3","4","5","6", "7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","X","Y")
+
+
+dim(cutoff[cutoff$`chromosome #`=="Y",]) 
+Cutoff_dets=c(3324,2506, 2093, 1728, 1950,1970, 1810, 1662, 1601,1622, 2188,2140, 1109, 1543,1494,1861,2185,1075, 2326, 1306,922, 1453, 543)  
+
+Cutoff_dets=data.frame((Cutoff_dets/33694)*100)
+rownames(Cutoff_dets)=rownames(H_cutoff_dense)
+
+X=cbind(H_cutoff_dense,Cutoff_dets)
+colnames(X)=c("before","after")
+write.table(X,"Compare_cutoff_chr_%_8.10.21", sep="\t")
+```
+
+Export final "info_for_cutoff.8.11.21.xlsx" for manual manipulation in excel
+```{Filter out genes not expressed in >= 11100 cells from cutoff}
+
+info_for_cutoff=info_for_cutoff[!(info_for_cutoff$Number.cells.with.0.counts>=11100),]
+dim(info_for_cutoff_8.10) #27091     4
+
+33694-27091 #6603 genes removed
+
+xlsx::write.xlsx(info_for_cutoff, file= "info_for_cutoff.8.11.21.xlsx", row.names=T, col.names=T)
+
+```
+
+
